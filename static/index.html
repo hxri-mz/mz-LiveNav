@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Live Navigation (Multi-Waypoint + Turns)</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+html,body{margin:0;padding:0;height:100%;font-family:Arial,sans-serif}
+#map{height:calc(100% - 100px)}
+#controls{padding:10px;background:#f4f4f4;display:flex;gap:10px;align-items:center;border-bottom:1px solid #ccc}
+button{padding:6px 10px;background:#0078ff;color:white;border:none;border-radius:5px;cursor:pointer}
+button:disabled{opacity:.5;cursor:not-allowed}
+#status{font-size:14px;margin-left:10px}
+#turnArrow{position:absolute;top:10px;right:10px;width:80px;height:80px;background:rgba(255,255,255,0.9);
+border-radius:10px;border:1px solid #ccc;display:flex;flex-direction:column;align-items:center;justify-content:center;font-size:18px;font-weight:bold;z-index:1000;text-align:center}
+#turnArrow span{font-size:14px}
+</style>
+</head>
+<body>
+<div id="controls">
+<button id="btnClear">Clear</button>
+<button id="btnCreateRoute">Create Route</button>
+<span id="status">Waiting for GNSS...</span>
+</div>
+<div id="map"></div>
+<div id="turnArrow">👆</div>
+
+<script>
+const map=L.map('map').setView([20.5937,78.9629],5);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{attribution:'&copy; OSM contributors'}).addTo(map);
+
+let routeId=null, routePoly=[], routeLine=null;
+let gnssMarker=null, activeRoute=false, followMode=true;
+let latestGNSS={lat:null,lon:null}, waypointMarkers=[];
+const statusEl=document.getElementById('status'), turnArrowEl=document.getElementById('turnArrow');
+
+async function fetchLatestGNSS(){
+    try{
+        const res=await fetch('/latest_position');
+        if(!res.ok)return;
+        const data=await res.json();
+        latestGNSS={lat:data.lat,lon:data.lon};
+        updateGNSSMarker(data.lat,data.lon);
+        if(activeRoute) await updateTurnByTurn();
+    }catch(e){console.warn('GNSS fetch error',e);}
+}
+setInterval(fetchLatestGNSS,1000);
+
+function updateGNSSMarker(lat,lon){
+    if(!gnssMarker){
+        gnssMarker=L.circleMarker([lat,lon],{radius:7,color:'blue',fillColor:'blue',fillOpacity:1}).addTo(map).bindPopup('Current Position');
+        map.setView([lat,lon],15);
+    }else gnssMarker.setLatLng([lat,lon]);
+    if(followMode) map.panTo([lat,lon]);
+}
+
+map.on('click',(e)=>{
+    const {lat,lng}=e.latlng;
+    const marker=L.marker([lat,lng],{icon:L.icon({iconUrl:'https://cdn-icons-png.flaticon.com/512/684/684908.png',iconSize:[25,25]})})
+      .addTo(map).bindPopup(`Waypoint ${waypointMarkers.length+1}`).openPopup();
+    waypointMarkers.push(marker);
+    statusEl.textContent=`Added waypoint #${waypointMarkers.length}`;
+});
+
+document.getElementById('btnCreateRoute').onclick=async ()=>{
+    if(!latestGNSS.lat){alert("Waiting for GNSS fix..."); return;}
+    if(waypointMarkers.length===0){alert("Click on map to add at least one waypoint."); return;}
+    const origin=[latestGNSS.lon,latestGNSS.lat];
+    const destinations=waypointMarkers.map(m=>[m.getLatLng().lng,m.getLatLng().lat]);
+    const waypoints=[origin,...destinations];
+    statusEl.textContent='Requesting route...';
+    const res=await fetch('/route',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({waypoints})});
+    if(!res.ok){statusEl.textContent='Route fetch error'; return;}
+    const data=await res.json();
+    routeId=data.route_id;
+    routePoly=data.geometry.map(([lon,lat])=>[lat,lon]);
+    if(routeLine) map.removeLayer(routeLine);
+    routeLine=L.polyline(routePoly,{color:'blue',weight:4}).addTo(map);
+    map.fitBounds(routeLine.getBounds());
+    statusEl.textContent=`Route ready (${(data.distance_m/1000).toFixed(2)} km)`;
+    activeRoute=true;
+    await fetch('/set_route_id',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({route_id:routeId})});
+};
+
+async function updateTurnByTurn(){
+    if(!routeId||!latestGNSS.lat) return;
+    const res=await fetch('/position',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({route_id:routeId,position:[latestGNSS.lon,latestGNSS.lat]})});
+    if(!res.ok) return;
+    const data=await res.json();
+    if(data.next_maneuver){
+        const man=data.next_maneuver;
+        const dist=man.distance_to_maneuver_m||0;
+        const mod=(man.modifier||"").toLowerCase();
+        const arrow=mod.includes('left')?'👈':mod.includes('right')?'👉':mod.includes('uturn')?'↩️':'👆';
+        turnArrowEl.innerHTML=`<span style="font-size:32px">${arrow}</span><span>${dist.toFixed(0)} m</span>`;
+        statusEl.textContent=`Next: ${mod||'straight'} in ${dist.toFixed(0)} m`;
+    }else{
+        turnArrowEl.innerHTML='👆';
+        statusEl.textContent='Approaching destination...';
+    }
+}
+
+document.getElementById('btnClear').onclick=()=>{
+    if(routeLine) map.removeLayer(routeLine);
+    waypointMarkers.forEach(m=>map.removeLayer(m));
+    waypointMarkers=[];
+    routeId=null; activeRoute=false;
+    statusEl.textContent='Cleared route.';
+    turnArrowEl.innerHTML='👆';
+};
+
+let turnMarkers=[];  // store turn markers
+let destinationMarker=null;  // store the final destination marker
+
+document.getElementById('btnCreateRoute').onclick=async ()=>{
+    if(!latestGNSS.lat){alert("Waiting for GNSS fix..."); return;}
+    if(waypointMarkers.length===0){alert("Click on map to add at least one waypoint."); return;}
+    
+    const origin=[latestGNSS.lon,latestGNSS.lat];
+    const destinations=waypointMarkers.map(m=>[m.getLatLng().lng,m.getLatLng().lat]);
+    const waypoints=[origin,...destinations];
+
+    statusEl.textContent='Requesting route...';
+    const res=await fetch('/route',{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({waypoints})
+    });
+    if(!res.ok){statusEl.textContent='Route fetch error'; return;}
+    const data=await res.json();
+    
+    routeId=data.route_id;
+    routePoly=data.geometry.map(([lon,lat])=>[lat,lon]);
+    if(routeLine) map.removeLayer(routeLine);
+    routeLine=L.polyline(routePoly,{color:'blue',weight:4}).addTo(map);
+    map.fitBounds(routeLine.getBounds());
+    
+    // --- Remove all waypoint markers except last one ---
+    waypointMarkers.slice(0,-1).forEach(m=>map.removeLayer(m));
+    const lastWaypoint = waypointMarkers[waypointMarkers.length-1];
+    waypointMarkers = [lastWaypoint];
+
+    // --- Place destination marker ---
+    if(destinationMarker) map.removeLayer(destinationMarker);
+    const [destLat,destLon] = [lastWaypoint.getLatLng().lat, lastWaypoint.getLatLng().lng];
+    destinationMarker = L.marker([destLat,destLon],{
+        icon:L.icon({iconUrl:'https://cdn-icons-png.flaticon.com/512/684/684908.png',iconSize:[30,30]})
+    }).addTo(map).bindPopup("Destination").openPopup();
+
+    // Remove old turn markers
+    turnMarkers.forEach(m=>map.removeLayer(m));
+    turnMarkers=[];
+    // --- Add turn markers ---
+    data.maneuvers.forEach((man,idx)=>{
+        const [lat,lon] = [man.location[1], man.location[0]];
+        const arrow = (man.modifier||"").toLowerCase().includes('left') ? '👈' :
+                      (man.modifier||"").toLowerCase().includes('right') ? '👉' :
+                      (man.modifier||"").toLowerCase().includes('uturn') ? '↩️' : '👆';
+        const marker=L.marker([lat,lon],{
+            icon:L.divIcon({
+                html:`<span style="font-size:20px">${arrow}</span>`,
+                className:'',
+                iconSize:[24,24]
+            })
+        }).addTo(map).bindPopup(`Turn ${idx+1}: ${man.instruction}`);
+        turnMarkers.push(marker);
+    });
+
+    statusEl.textContent=`Route ready (${(data.distance_m/1000).toFixed(2)} km) with ${data.maneuvers.length} turns`;
+    activeRoute=true;
+    await fetch('/set_route_id',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({route_id:routeId})});
+};
+</script>
+</body>
+</html>
