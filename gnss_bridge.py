@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import sys
 import time
 import os
@@ -7,12 +6,11 @@ from ecal.core.subscriber import ProtoSubscriber
 from mz_schemas_protobuf.Pose_pb2 import Pose
 import json
 import requests
+import math
 
-# --- Configuration ---
 FLASK_URL = "http://localhost:5000/position"
-ROUTE_ID = None  # Will be set from server or manually
+ROUTE_ID = None 
 
-# Optional logging
 session_name = "live_gnss"
 log_dir = f"logs/{session_name}"
 os.makedirs(log_dir, exist_ok=True)
@@ -29,7 +27,6 @@ def get_active_route_id():
     except:
         return None
 
-# --- GNSS Callback ---
 def gnss_callback(topic_name, pose: Pose, timestamp):
     try:
         lat = pose.lat_lon_ht.latitude_deg
@@ -38,24 +35,24 @@ def gnss_callback(topic_name, pose: Pose, timestamp):
 
         print(f"Timestamp: {timestamp} | Lat: {lat:.6f} | Lon: {lon:.6f} | Yaw: {yaw:.3f}")
 
-        payload = {"lat": lat, "lon": lon}
+        payload = {"lat": lat, "lon": lon, "yaw": math.degrees(yaw)}
         requests.post("http://localhost:5000/update_gnss", json=payload)
 
     except Exception as e:
         print("Error sending GNSS data:", e)
 
-# --- Main ---
 if __name__ == "__main__":
     ecal_core.initialize(sys.argv, "Live GNSS Bridge")
 
-    sub = ProtoSubscriber("rec_gnss", Pose)
+    sub = ProtoSubscriber("gnss", Pose)
     sub.set_callback(gnss_callback)
 
     print("Live GNSS bridge started... listening on 'rec_gnss'")
 
     try:
         while ecal_core.ok():
-            time.sleep(0.02)  # 50 Hz
+            # time.sleep(0.02)
+            pass
     except KeyboardInterrupt:
         print("Interrupted by user")
     finally:
