@@ -166,7 +166,8 @@
             routeLine = null;
         let gnssMarker = null,
             activeRoute = false,
-            followMode = false;
+            followMode = false,
+            plotProj = false;
         let latestGNSS = { lat: null, lon: null, yaw: 0 };
         let waypointMarkers = [],
             turnMarkers = [],
@@ -185,7 +186,6 @@
         }
 
         function adjustYawForMap(yawDegrees) {            
-            // Option 1: If 0° is North and rotation is clockwise (standard compass)
             if (normalizeAngle(yawDegrees) < 180){
                 return normalizeAngle(-yawDegrees);
             }
@@ -224,7 +224,7 @@
                 console.warn('GNSS fetch error', e);
             }
         }
-        setInterval(fetchLatestGNSS, 1000);
+        setInterval(fetchLatestGNSS, 100);
 
         function updateOrientationInfo() {
             const yawDegrees = adjustYawForMap(latestGNSS.yaw);
@@ -410,6 +410,18 @@
             });
             if (!res.ok) return;
             const data = await res.json();
+
+            projected_pos = data.projected_point
+            console.log(projected_pos)
+            
+            if (plotProj) {
+            projMarker = L.marker([projected_pos[1], projected_pos[0]], {
+                    icon: L.icon({
+                    iconUrl: 'https://cdn-icons-png.flaticon.com/512/684/684908.png',
+                    iconSize: [12, 12]
+                    })
+                }).addTo(map).bindPopup('proj');
+            }
 
             if (data.rerouted && data.new_route_id) {
                 routeId = data.new_route_id;

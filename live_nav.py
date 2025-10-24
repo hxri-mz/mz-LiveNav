@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 from flask import Flask, request, jsonify, abort
 import requests
 import uuid
@@ -13,17 +14,19 @@ GEOMETRY = "geojson"
 STEPS = "true"
 
 REROUTE_THRESHOLD_M = 20.0
-NO_PROGRESS_LIMIT = 4
-NO_PROGRESS_EPS_M = 1.0
 WAYPOINT_PASSED_BUFFER_M = 5.0
+STEP_M = 0.5 # Interpolation resolution in centimeters 
+WINDOW_SIZE = 20
+ENABLE_REROUTE = False
 
 LATEST_GNSS = None
 LATEST_GNSS_LOCK = Lock()
 
-active_route_id = None
+NAV_CMD = {"turn": None, "distance_m": None}
+NAV_CMD_LOCK = Lock()
+
 ROUTES = {}
 ROUTES_LOCK = Lock()
-
 
 def haversine_m(lon1, lat1, lon2, lat2):
     lon1_r, lat1_r, lon2_r, lat2_r = map(math.radians, (lon1, lat1, lon2, lat2))
@@ -34,34 +37,12 @@ def haversine_m(lon1, lat1, lon2, lat2):
     R = 6371000.0
     return R * c
 
-
-def point_segment_projection(lon, lat, lon1, lat1, lon2, lat2):
-    lat0 = math.radians((lat1 + lat2) / 2.0)
-    def xy_from(lon_, lat_):
-        x = math.radians(lon_) * math.cos(lat0) * 6371000.0
-        y = math.radians(lat_) * 6371000.0
-        return (x, y)
-    px, py = xy_from(lon, lat)
-    ax, ay = xy_from(lon1, lat1)
-    bx, by = xy_from(lon2, lat2)
-    dx = bx - ax
-    dy = by - ay
-    if dx == 0 and dy == 0:
-        return lon1, lat1, 0.0
-    t = ((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy)
-    t_clamped = max(0.0, min(1.0, t))
-    lon_proj = lon1 + (lon2 - lon1) * t_clamped
-    lat_proj = lat1 + (lat2 - lat1) * t_clamped
-    return lon_proj, lat_proj, t_clamped
-
-
 def decode_polyline(polyline_str):
     index, lat, lng = 0, 0, 0
     coordinates = []
     str_len = len(polyline_str)
     while index < str_len:
-        shift = 0
-        result = 0
+        shift, result = 0, 0
         while True:
             b = ord(polyline_str[index]) - 63
             index += 1
@@ -70,9 +51,7 @@ def decode_polyline(polyline_str):
             if b < 0x20: break
         dlat = ~(result >> 1) if (result & 1) else (result >> 1)
         lat += dlat
-
-        shift = 0
-        result = 0
+        shift, result = 0, 0
         while True:
             b = ord(polyline_str[index]) - 63
             index += 1
@@ -81,10 +60,23 @@ def decode_polyline(polyline_str):
             if b < 0x20: break
         dlng = ~(result >> 1) if (result & 1) else (result >> 1)
         lng += dlng
-
         coordinates.append((lng / 1e5, lat / 1e5))
     return coordinates
 
+def densify_polyline(poly, step_m=1.0):
+    dense = [poly[0]]
+    for i in range(1, len(poly)):
+        lon1, lat1 = poly[i - 1]
+        lon2, lat2 = poly[i]
+        dist = haversine_m(lon1, lat1, lon2, lat2)
+        n_points = int(dist // step_m)
+        for j in range(1, n_points):
+            t = j / n_points
+            lon_i = lon1 + (lon2 - lon1) * t
+            lat_i = lat1 + (lat2 - lat1) * t
+            dense.append((lon_i, lat_i))
+        dense.append((lon2, lat2))
+    return dense
 
 def cumulative_distances_along(poly):
     if not poly: return []
@@ -94,34 +86,23 @@ def cumulative_distances_along(poly):
         cum.append(cum[-1] + d)
     return cum
 
-
-def find_projection_on_polyline(lon, lat, poly, cum_dist):
+def find_projection_on_polyline_window(lon, lat, poly, cum_dist, last_idx=0, window_size=WINDOW_SIZE):
+    n = len(poly)
     if not poly:
         return 0.0, 0, lon, lat
-
+    start_idx = last_idx
+    end_idx = min(n, last_idx + window_size)
     best_dist = float('inf')
-    best_proj = None
-    best_seg_idx = None
-    best_t = None
-    proj_along = 0.0
-
-    for i in range(1, len(poly)):
-        a_lon, a_lat = poly[i-1]
-        b_lon, b_lat = poly[i]
-        lon_p, lat_p, t = point_segment_projection(lon, lat, a_lon, a_lat, b_lon, b_lat)
-        d_to_proj = haversine_m(lon, lat, lon_p, lat_p)
-        if d_to_proj < best_dist:
-            best_dist = d_to_proj
-            seg_length = cum_dist[i] - cum_dist[i-1] if cum_dist else 0.0
-            proj_along = cum_dist[i-1] + t * seg_length if cum_dist else 0.0
-            best_proj = (lon_p, lat_p)
-            best_seg_idx = i
-            best_t = t
-
-    if best_proj is None:
-        return 0.0, 1, poly[0][0], poly[0][1]
-    return proj_along, best_seg_idx, best_proj[0], best_proj[1]
-
+    best_idx = last_idx
+    for i in range(start_idx, end_idx):
+        p_lon, p_lat = poly[i]
+        d = haversine_m(lon, lat, p_lon, p_lat)
+        if d < best_dist:
+            best_dist = d
+            best_idx = i
+    proj_along = cum_dist[best_idx] if cum_dist else 0.0
+    best_lon, best_lat = poly[best_idx]
+    return proj_along, best_idx, best_lon, best_lat
 
 def request_route_from_osrm_multi(waypoints):
     if len(waypoints) < 2:
@@ -132,20 +113,21 @@ def request_route_from_osrm_multi(waypoints):
     resp = requests.get(url, params=params, timeout=15)
     resp.raise_for_status()
     data = resp.json()
-    if not data.get("routes"): raise ValueError("No routes returned by OSRM.")
+    if not data.get("routes"):
+        raise ValueError("No routes returned by OSRM.")
     route = data["routes"][0]
-
     geom = route.get("geometry")
     if isinstance(geom, dict) and "coordinates" in geom:
         poly = [(pt[0], pt[1]) for pt in geom["coordinates"]]
     elif isinstance(geom, str):
         poly = decode_polyline(geom)
     else:
-        try: poly = [(pt[0], pt[1]) for pt in route["geometry"]["coordinates"]]
-        except Exception: raise ValueError("Unsupported geometry format from OSRM.")
-
+        try:
+            poly = [(pt[0], pt[1]) for pt in route["geometry"]["coordinates"]]
+        except Exception:
+            raise ValueError("Unsupported geometry format from OSRM.")
+    poly = densify_polyline(poly, step_m=STEP_M)
     cuml = cumulative_distances_along(poly)
-
     maneuvers = []
     for leg in route.get("legs", []):
         for step in leg.get("steps", []):
@@ -154,7 +136,7 @@ def request_route_from_osrm_multi(waypoints):
             if man_type in ("turn", "new name", "roundabout", "fork", "merge", "ramp"):
                 loc = maneuver.get("location")
                 if not loc: continue
-                best_along = find_projection_on_polyline(loc[0], loc[1], poly, cuml)[0]
+                best_along = find_projection_on_polyline_window(loc[0], loc[1], poly, cuml, 0, len(poly))[0]
                 maneuvers.append({
                     "instruction": step.get("name") or step.get("ref") or "",
                     "name": step.get("name", ""),
@@ -164,7 +146,6 @@ def request_route_from_osrm_multi(waypoints):
                     "distance_along": best_along
                 })
     maneuvers.sort(key=lambda m: m["distance_along"])
-
     return {
         "poly": poly,
         "cumulative": cuml,
@@ -172,26 +153,22 @@ def request_route_from_osrm_multi(waypoints):
         "distance": route.get("distance"),
         "duration": route.get("duration"),
         "geometry": [[p[0], p[1]] for p in poly],
-        "waypoints": waypoints
+        "waypoints": waypoints,
+        "last_proj_idx": 0,
+        "no_progress_count": 0
     }
-
 
 @app.route("/route", methods=["POST"])
 def create_route():
     body = request.get_json()
     if not body: abort(400, "Missing JSON body")
-    if "origin" in body and "destination" in body:
-        waypoints = [body["origin"], body["destination"]]
-    else:
-        waypoints = body.get("waypoints")
+    waypoints = [body["origin"], body["destination"]] if "origin" in body and "destination" in body else body.get("waypoints")
     if not waypoints or len(waypoints) < 2: abort(400, "Need at least 2 waypoints")
     try:
         parsed = request_route_from_osrm_multi(waypoints)
     except Exception as e:
         abort(500, f"OSRM error: {e}")
     route_id = str(uuid.uuid4())
-    parsed["last_remaining"] = None
-    parsed["no_progress_count"] = 0
     with ROUTES_LOCK:
         ROUTES[route_id] = parsed
     man_summary = [{
@@ -210,7 +187,6 @@ def create_route():
         "geometry": parsed["geometry"]
     })
 
-
 @app.route("/position", methods=["POST"])
 def update_position():
     global LATEST_GNSS
@@ -228,85 +204,67 @@ def update_position():
     poly = route["poly"]
     cuml = route["cumulative"]
     maneuvers = route["maneuvers"]
+    last_idx = route.get("last_proj_idx", 0)
 
-    proj_along, seg_idx, lon_p, lat_p = find_projection_on_polyline(lon, lat, poly, cuml)
+    proj_along, seg_idx, lon_p, lat_p = find_projection_on_polyline_window(lon, lat, poly, cuml, last_idx, WINDOW_SIZE)
+    route["last_proj_idx"] = seg_idx
     dist_to_route = haversine_m(lon, lat, lon_p, lat_p)
-    remaining_to_end = (cuml[-1] - proj_along) if cuml else 0.0
+    remaining_to_end = cuml[-1] - proj_along if cuml else 0.0
 
-    buffer_m = 0.0
     next_man = None
+    buffer_m = 0.0
     for m in maneuvers:
         if m["distance_along"] > proj_along + buffer_m:
             next_man = m
             break
 
-    last_remaining = route.get("last_remaining")
-    no_progress_count = route.get("no_progress_count", 0)
     rerouted = False
-    new_route_id = None
     new_route_info = None
-
-    if last_remaining is None:
-        route["last_remaining"] = remaining_to_end
-        route["no_progress_count"] = 0
-    else:
-        if remaining_to_end >= last_remaining - NO_PROGRESS_EPS_M:
-            no_progress_count += 1
-        else:
-            no_progress_count = 0
-        route["last_remaining"] = remaining_to_end
-        route["no_progress_count"] = no_progress_count
-
-    # -------------------- Forward-only reroute -------------------- #
-    if dist_to_route > REROUTE_THRESHOLD_M or no_progress_count >= NO_PROGRESS_LIMIT:
+    new_route_id = None
+    if ENABLE_REROUTE and dist_to_route > REROUTE_THRESHOLD_M:
         original_waypoints = route.get("waypoints", []) or []
         remaining_waypoints = []
-        try:
-            for wp in original_waypoints:
-                wp_lon, wp_lat = wp
-                wp_along = find_projection_on_polyline(wp_lon, wp_lat, poly, cuml)[0]
-                if wp_along > proj_along + WAYPOINT_PASSED_BUFFER_M:
-                    remaining_waypoints.append([wp_lon, wp_lat])
-        except Exception:
-            remaining_waypoints = []
-
-        # If nothing ahead, just use final destination
+        for wp in original_waypoints:
+            wp_lon, wp_lat = wp
+            wp_along, _, _, _ = find_projection_on_polyline_window(wp_lon, wp_lat, poly, cuml, seg_idx, len(poly)-seg_idx)
+            if wp_along > proj_along + WAYPOINT_PASSED_BUFFER_M:
+                remaining_waypoints.append([wp_lon, wp_lat])
         if not remaining_waypoints:
             remaining_waypoints = [original_waypoints[-1]]
-
         new_waypoints = [[lon, lat]] + remaining_waypoints
         try:
             parsed_new = request_route_from_osrm_multi(new_waypoints)
             new_route_id = str(uuid.uuid4())
-            parsed_new["last_remaining"] = None
-            parsed_new["no_progress_count"] = 0
             with ROUTES_LOCK:
                 ROUTES[new_route_id] = parsed_new
             rerouted = True
             new_route_info = parsed_new
+            route["poly"] = parsed_new["poly"]
+            route["cumulative"] = parsed_new["cumulative"]
+            route["maneuvers"] = parsed_new["maneuvers"]
+            route["geometry"] = [[p[0], p[1]] for p in parsed_new["poly"]]
+            route["waypoints"] = parsed_new["waypoints"]
+            route["last_proj_idx"] = 0
+            poly = route["poly"]
+            cuml = route["cumulative"]
+            maneuvers = route["maneuvers"]
+            proj_along, seg_idx, lon_p, lat_p = find_projection_on_polyline_window(lon, lat, poly, cuml, 0, len(poly))
+            route["last_proj_idx"] = seg_idx
+            remaining_to_end = cuml[-1] - proj_along if cuml else 0.0
+            next_man = None
+            for m in maneuvers:
+                if m["distance_along"] > proj_along + buffer_m:
+                    next_man = m
+                    break
         except Exception as e:
             print("Reroute failed:", e)
             rerouted = False
             new_route_info = None
-            new_route_id = None
-        route["no_progress_count"] = 0
 
-    if rerouted and new_route_info:
-        poly = new_route_info["poly"]
-        cuml = new_route_info["cumulative"]
-        maneuvers = new_route_info["maneuvers"]
-        proj_along, seg_idx, lon_p, lat_p = find_projection_on_polyline(lon, lat, poly, cuml)
-        remaining_to_end = (cuml[-1] - proj_along) if cuml else 0.0
-        next_man = None
-        for m in maneuvers:
-            if m["distance_along"] > proj_along + buffer_m:
-                next_man = m
-                break
-
+    distance_to_next = None
+    next_maneuver_info = None
     if next_man:
-        distance_to_next = max(0.0, haversine_m(lon_p, lat_p,
-                                               next_man["location"][0],
-                                               next_man["location"][1]))
+        distance_to_next = max(0.0, haversine_m(lon_p, lat_p, next_man["location"][0], next_man["location"][1]))
         next_maneuver_info = {
             "instruction": next_man.get("instruction"),
             "name": next_man.get("name"),
@@ -315,9 +273,22 @@ def update_position():
             "location": [next_man["location"][0], next_man["location"][1]],
             "distance_to_maneuver_m": distance_to_next
         }
-    else:
-        distance_to_next = None
-        next_maneuver_info = None
+
+    with NAV_CMD_LOCK:
+        if next_man:
+            man_type = (next_man.get("type") or "").lower()
+            modifier = (next_man.get("modifier") or "").lower()
+            turn = "straight"
+            if "turn" in man_type:
+                if modifier in ("left", "slight left", "sharp left"):
+                    turn = "left"
+                elif modifier in ("right", "slight right", "sharp right"):
+                    turn = "right"
+            NAV_CMD["turn"] = turn
+            NAV_CMD["distance_m"] = distance_to_next
+        else:
+            NAV_CMD["turn"] = "straight"
+            NAV_CMD["distance_m"] = 0.0
 
     resp = {
         "projected_point": [lon_p, lat_p],
@@ -326,7 +297,6 @@ def update_position():
         "remaining_distance_m": remaining_to_end,
         "rerouted": rerouted
     }
-
     if rerouted and new_route_info:
         resp.update({
             "new_route_id": new_route_id,
@@ -342,9 +312,7 @@ def update_position():
             "distance_m": new_route_info.get("distance"),
             "duration_s": new_route_info.get("duration")
         })
-
     return jsonify(resp)
-
 
 @app.route("/latest_position", methods=["GET"])
 def latest_position():
@@ -353,21 +321,9 @@ def latest_position():
             return jsonify({"error": "No GNSS data yet"}), 404
         return jsonify(LATEST_GNSS)
 
-
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "routes_stored": len(ROUTES)})
-
-
-@app.route('/set_route_id', methods=['POST'])
-def set_route_id():
-    global active_route_id
-    data = request.get_json()
-    route_id = data.get("route_id")
-    if not route_id: abort(400, "Missing route_id")
-    active_route_id = route_id
-    return jsonify({"status": "ok", "route_id": route_id})
-
 
 @app.route("/update_gnss", methods=["POST"])
 def update_gnss():
@@ -379,6 +335,12 @@ def update_gnss():
         LATEST_GNSS = {"lat": data["lat"], "lon": data["lon"], "yaw": data.get("yaw")}
     return jsonify({"status": "ok"})
 
+@app.route("/nav_cmd", methods=["GET"])
+def get_next_turn():
+    with NAV_CMD_LOCK:
+        if NAV_CMD["turn"] is None:
+            return jsonify({"error": "No turn info available"}), 404
+        return jsonify(NAV_CMD)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
