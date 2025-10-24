@@ -216,7 +216,7 @@
                     lon: data.lon, 
                     yaw: data.yaw || 0 
                 };
-                console.log('Raw Yaw:', data.yaw, 'Adjusted:', adjustYawForMap(data.yaw));
+                // console.log('Raw Yaw:', data.yaw, 'Adjusted:', adjustYawForMap(data.yaw));
                 updateGNSSMarker(data.lat, data.lon);
                 updateOrientationInfo();
                 if (activeRoute) await updateTurnByTurn();
@@ -224,7 +224,7 @@
                 console.warn('GNSS fetch error', e);
             }
         }
-        setInterval(fetchLatestGNSS, 100);
+        setInterval(fetchLatestGNSS, 50);
 
         function updateOrientationInfo() {
             const yawDegrees = adjustYawForMap(latestGNSS.yaw);
@@ -394,11 +394,11 @@
             statusEl.textContent = `Route ready (${(data.distance_m / 1000).toFixed(2)} km) with ${data.maneuvers.length} turns`;
             activeRoute = true;
 
-            await fetch('/set_route_id', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ route_id: routeId })
-            });
+            // await fetch('/set_route_id', {
+            //     method: 'POST',
+            //     headers: { 'Content-Type': 'application/json' },
+            //     body: JSON.stringify({ route_id: routeId })
+            // });
         };
 
         async function updateTurnByTurn() {
@@ -412,7 +412,7 @@
             const data = await res.json();
 
             projected_pos = data.projected_point
-            console.log(projected_pos)
+            // console.log(projected_pos)
             
             if (plotProj) {
             projMarker = L.marker([projected_pos[1], projected_pos[0]], {
@@ -463,7 +463,18 @@
             }
         }
 
-        document.getElementById('btnClear').onclick = () => {
+        document.getElementById('btnClear').onclick = async () => {
+            try {
+                await fetch('/clear_route', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ route_id: routeId })
+                });
+                console.log('Cleared route successfully')
+            } catch (err) {
+                console.warn('clear_route request failed', err);
+            }
+
             if (routeLine) map.removeLayer(routeLine);
             waypointMarkers.forEach(m => map.removeLayer(m));
             turnMarkers.forEach(m => map.removeLayer(m));
@@ -479,10 +490,6 @@
             statusEl.textContent = 'Cleared route.';
             turnArrowEl.innerHTML = '👆';
         };
-
-        if (latestGNSS.lat) {
-            setEgoCentricView();
-        }
     </script>
 </body>
 

@@ -22,7 +22,7 @@ ENABLE_REROUTE = False
 LATEST_GNSS = None
 LATEST_GNSS_LOCK = Lock()
 
-NAV_CMD = {"turn": None, "distance_m": None}
+NAV_CMD = {"status": None, "turn_type": None, "turn_m": None, "destination_m": None, "message": None}
 NAV_CMD_LOCK = Lock()
 
 ROUTES = {}
@@ -189,6 +189,7 @@ def create_route():
 
 @app.route("/position", methods=["POST"])
 def update_position():
+    remaining_to_end = 0.0
     global LATEST_GNSS
     body = request.get_json()
     if not body or "route_id" not in body or "position" not in body:
@@ -275,7 +276,7 @@ def update_position():
         }
 
     with NAV_CMD_LOCK:
-        if next_man:
+        if remaining_to_end != 0.0 and next_man and dist_to_route < REROUTE_THRESHOLD_M:
             man_type = (next_man.get("type") or "").lower()
             modifier = (next_man.get("modifier") or "").lower()
             turn = "straight"
@@ -284,11 +285,17 @@ def update_position():
                     turn = "left"
                 elif modifier in ("right", "slight right", "sharp right"):
                     turn = "right"
-            NAV_CMD["turn"] = turn
-            NAV_CMD["distance_m"] = distance_to_next
+            NAV_CMD["status"] = "success"
+            NAV_CMD["turn_type"] = turn
+            NAV_CMD["turn_m"] = distance_to_next
+            NAV_CMD["destination_m"] = remaining_to_end
+            NAV_CMD["message"] = next_man.get("instruction")
         else:
-            NAV_CMD["turn"] = "straight"
-            NAV_CMD["distance_m"] = 0.0
+            NAV_CMD["status"] = "error"
+            NAV_CMD["turn_type"] = ""
+            NAV_CMD["turn_m"] = 0.0
+            NAV_CMD["destination_m"] = ""
+            NAV_CMD["message"] = "Went away from planned route."
 
     resp = {
         "projected_point": [lon_p, lat_p],
@@ -335,11 +342,38 @@ def update_gnss():
         LATEST_GNSS = {"lat": data["lat"], "lon": data["lon"], "yaw": data.get("yaw")}
     return jsonify({"status": "ok"})
 
+@app.route("/clear_route", methods=["POST"])
+def clear_route():
+    body = request.get_json(silent=True) or {}
+    route_id = body.get("route_id", None)
+
+    with ROUTES_LOCK:
+        if route_id:
+            ROUTES.pop(route_id, None)
+        else:
+            ROUTES.clear()
+
+    with NAV_CMD_LOCK:
+        NAV_CMD["status"] = None
+        NAV_CMD["turn_type"] = None
+        NAV_CMD["turn_m"] = None
+        NAV_CMD["destination_m"] = None
+        NAV_CMD["message"] = None
+
+    return jsonify({"status": "ok", "cleared_route_id": route_id})
+
+
 @app.route("/nav_cmd", methods=["GET"])
 def get_next_turn():
     with NAV_CMD_LOCK:
-        if NAV_CMD["turn"] is None:
-            return jsonify({"error": "No turn info available"}), 404
+        if NAV_CMD["turn_type"] is None:
+            # return jsonify({"error": "No turn info available"}), 404
+            NAV_CMD["status"] = "error"
+            NAV_CMD["turn_type"] = ""
+            NAV_CMD["turn_m"] = 0.0
+            NAV_CMD["destination_m"] = ""
+            NAV_CMD["message"] = "Route not created yet"
+            return jsonify(NAV_CMD)
         return jsonify(NAV_CMD)
 
 if __name__ == "__main__":
