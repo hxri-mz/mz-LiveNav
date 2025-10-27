@@ -15,7 +15,7 @@ STEPS = "true"
 
 REROUTE_THRESHOLD_M = 20.0
 WAYPOINT_PASSED_BUFFER_M = 5.0
-STEP_M = 0.5 # Interpolation resolution in centimeters 
+STEP_M = 0.5
 WINDOW_SIZE = 20
 ENABLE_REROUTE = False
 
@@ -28,6 +28,9 @@ NAV_CMD_LOCK = Lock()
 ROUTES = {}
 ROUTES_LOCK = Lock()
 
+ACTIVE_ROUTE_ID = None
+ACTIVE_ROUTE_LOCK = Lock()
+
 def haversine_m(lon1, lat1, lon2, lat2):
     lon1_r, lat1_r, lon2_r, lat2_r = map(math.radians, (lon1, lat1, lon2, lat2))
     dlon = lon2_r - lon1_r
@@ -36,6 +39,16 @@ def haversine_m(lon1, lat1, lon2, lat2):
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
     R = 6371000.0
     return R * c
+
+def compute_bearing(p1, p2):
+    """Compute bearing (yaw) in degrees from p1=(lon,lat) to p2=(lon,lat)."""
+    lon1, lat1, lon2, lat2 = map(math.radians, [p1[0], p1[1], p2[0], p2[1]])
+    dlon = lon2 - lon1
+    x = math.sin(dlon) * math.cos(lat2)
+    y = math.cos(lat1) * math.sin(lat2) - math.sin(lat1) * math.cos(lat2) * math.cos(dlon)
+    bearing = math.degrees(math.atan2(x, y))
+    return (bearing + 360) % 360
+
 
 def decode_polyline(polyline_str):
     index, lat, lng = 0, 0, 0
@@ -179,6 +192,11 @@ def create_route():
         "location": [m["location"][0], m["location"][1]],
         "distance_along_m": m["distance_along"]
     } for m in parsed["maneuvers"]]
+
+    with ACTIVE_ROUTE_LOCK:
+        global ACTIVE_ROUTE_ID
+        ACTIVE_ROUTE_ID = route_id
+
     return jsonify({
         "route_id": route_id,
         "distance_m": parsed["distance"],
@@ -321,12 +339,39 @@ def update_position():
         })
     return jsonify(resp)
 
-@app.route("/latest_position", methods=["GET"])
+@app.route("/latest_position")
 def latest_position():
-    with LATEST_GNSS_LOCK:
-        if LATEST_GNSS is None:
-            return jsonify({"error": "No GNSS data yet"}), 404
-        return jsonify(LATEST_GNSS)
+    global LATEST_GNSS, ACTIVE_ROUTE_ID
+
+    if not LATEST_GNSS:
+        return jsonify({"lat": None, "lon": None, "yaw": None}), 200
+
+    yaw = 0.0
+    active_route = None
+
+    with ROUTES_LOCK, ACTIVE_ROUTE_LOCK:
+        if ACTIVE_ROUTE_ID and ACTIVE_ROUTE_ID in ROUTES:
+            active_route = ROUTES[ACTIVE_ROUTE_ID]
+
+    if active_route and len(active_route["geometry"]) > 1:
+        user_point = (LATEST_GNSS["lon"], LATEST_GNSS["lat"])
+        poly = active_route["geometry"]
+
+        nearest_idx = min(
+            range(len(poly) - 1),
+            key=lambda i: (poly[i][0] - user_point[0]) ** 2 + (poly[i][1] - user_point[1]) ** 2
+        )
+
+        yaw = compute_bearing(poly[nearest_idx], poly[nearest_idx + 1])
+
+    LATEST_GNSS["yaw"] = yaw
+    return jsonify({
+        "lat": LATEST_GNSS["lat"],
+        "lon": LATEST_GNSS["lon"],
+        "yaw": yaw
+    })
+
+
 
 @app.route("/health", methods=["GET"])
 def health():
@@ -360,6 +405,15 @@ def clear_route():
         NAV_CMD["destination_m"] = None
         NAV_CMD["message"] = None
 
+    with ACTIVE_ROUTE_LOCK:
+        global ACTIVE_ROUTE_ID
+        if route_id:
+            if ACTIVE_ROUTE_ID == route_id:
+                ACTIVE_ROUTE_ID = None
+        else:
+            ACTIVE_ROUTE_ID = None
+
+
     return jsonify({"status": "ok", "cleared_route_id": route_id})
 
 
@@ -367,7 +421,6 @@ def clear_route():
 def get_next_turn():
     with NAV_CMD_LOCK:
         if NAV_CMD["turn_type"] is None:
-            # return jsonify({"error": "No turn info available"}), 404
             NAV_CMD["status"] = "error"
             NAV_CMD["turn_type"] = ""
             NAV_CMD["turn_m"] = 0.0

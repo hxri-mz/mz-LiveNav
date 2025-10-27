@@ -185,26 +185,10 @@
             return (degrees % 360 + 360) % 360;
         }
 
-        function adjustYawForMap(yawDegrees) {            
-            if (normalizeAngle(yawDegrees) < 180){
-                return normalizeAngle(-yawDegrees);
-            }
-            else {
-                return normalizeAngle(-(180-yawDegrees));
-            }
-            
-            // Option 2: If 0° is North but rotation is counter-clockwise
-            // return normalizeAngle(-yawDegrees);
-            
-            // Option 3: If 0° is East and rotation is clockwise
-            // return normalizeAngle(yawDegrees - 90);
-            
-            // Option 4: If 0° is East but rotation is counter-clockwise  
-            // return normalizeAngle(-yawDegrees - 90);
-            
-            // Option 5: If the map is rotating opposite to expected
-            // return normalizeAngle(180 - yawDegrees);
+        function adjustYawForMap(yawDegrees) {
+            return -(yawDegrees + 360) % 360;
         }
+
 
         async function fetchLatestGNSS() {
             try {
@@ -269,14 +253,16 @@
             }
         }
 
+        let lastYaw = 0;
+        function smoothYaw(newYaw, alpha = 0.2) {
+            lastYaw = lastYaw + alpha * ((newYaw - lastYaw + 540) % 360 - 180);
+            return (lastYaw + 360) % 360;
+        }
+
         function setEgoCentricView() {
             if (!latestGNSS.lat) return;
-            
             map.setView([latestGNSS.lat, latestGNSS.lon], 18);
-            let bearing = adjustYawForMap(latestGNSS.yaw);
-            
-            console.log('Setting bearing:', bearing);
-            
+            const bearing = smoothYaw(adjustYawForMap(latestGNSS.yaw));
             map.setBearing(bearing);
         }
 
