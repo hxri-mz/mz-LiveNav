@@ -137,7 +137,7 @@
     <div id="controls">
         <button id="btnClear"; style="background-color:rgb(221, 74, 74)">Clear</button>
         <button id="btnCreateRoute"; style="background-color:rgb(54, 116, 54)">Create Route</button>
-        <button id="btnToggleView">View: Ego-Centric</button>
+        <!-- <button id="btnToggleView">View: Ego-Centric</button> -->
         <button id="btnFollowMode">Follow: OFF</button>
         <span id="status">Waiting for GNSS...</span>
     </div>
@@ -177,7 +177,7 @@
         const statusEl = document.getElementById('status'),
             turnArrowEl = document.getElementById('turnArrow'),
             orientationInfoEl = document.getElementById('orientationInfo'),
-            toggleViewBtn = document.getElementById('btnToggleView'),
+            // toggleViewBtn = document.getElementById('btnToggleView'),
             compassRoseEl = document.getElementById('compassRose'),
             followModeBtn = document.getElementById('btnFollowMode');
 
@@ -188,7 +188,6 @@
         function adjustYawForMap(yawDegrees) {
             return -(yawDegrees + 360) % 360;
         }
-
 
         async function fetchLatestGNSS() {
             try {
@@ -266,19 +265,19 @@
             map.setBearing(bearing);
         }
 
-        toggleViewBtn.onclick = () => {
-            isEgoCentricView = !isEgoCentricView;
-            toggleViewBtn.textContent = isEgoCentricView ? 'View: Normal' : 'View: Ego-Centric';
+        // toggleViewBtn.onclick = () => {
+        //     isEgoCentricView = !isEgoCentricView;
+        //     toggleViewBtn.textContent = isEgoCentricView ? 'View: Normal' : 'View: Ego-Centric';
             
-            if (isEgoCentricView && latestGNSS.lat) {
-                setEgoCentricView();
-            } else {
-                map.setBearing(0);
-                if (latestGNSS.lat) {
-                    map.setView([latestGNSS.lat, latestGNSS.lon], 15);
-                }
-            }
-        };
+        //     if (isEgoCentricView && latestGNSS.lat) {
+        //         setEgoCentricView();
+        //     } else {
+        //         map.setBearing(0);
+        //         if (latestGNSS.lat) {
+        //             map.setView([latestGNSS.lat, latestGNSS.lon], 15);
+        //         }
+        //     }
+        // };
 
         followModeBtn.onclick = () => {
             followMode = !followMode;
@@ -303,15 +302,30 @@
         testYawAdjustment();
 
         map.on('click', e => {
+            const currentBearing = map.getBearing();
+            
+            if (currentBearing !== 0) {
+                map.setBearing(0);
+            }
+            
             const { lat, lng } = e.latlng;
             const marker = L.marker([lat, lng], {
                 icon: L.icon({
                     iconUrl: 'https://cdn-icons-png.flaticon.com/512/684/684908.png',
-                    iconSize: [25, 25]
+                    iconSize: [25, 25],
+                    iconAnchor: [12, 12] // Center of the icon
                 })
             }).addTo(map).bindPopup(`Waypoint ${waypointMarkers.length + 1}`).openPopup();
             waypointMarkers.push(marker);
             statusEl.textContent = `Added waypoint #${waypointMarkers.length}`;
+            
+            setTimeout(() => {
+                if (isEgoCentricView && latestGNSS.lat) {
+                    setEgoCentricView();
+                } else if (currentBearing !== 0) {
+                    map.setBearing(currentBearing);
+                }
+            }, 100);
         });
 
         document.getElementById('btnCreateRoute').onclick = async () => {
@@ -322,6 +336,13 @@
             if (waypointMarkers.length === 0) {
                 alert("Click on map to add at least one waypoint.");
                 return;
+            }
+
+            const currentBearing = map.getBearing();
+            const currentZoom = map.getZoom();
+
+            if (currentBearing !== 0) {
+                map.setBearing(0);
             }
 
             const origin = [latestGNSS.lon, latestGNSS.lat];
@@ -336,6 +357,10 @@
             });
             if (!res.ok) {
                 statusEl.textContent = 'Route fetch error';
+                // Restore bearing on error
+                if (currentBearing !== 0) {
+                    map.setBearing(currentBearing);
+                }
                 return;
             }
             const data = await res.json();
@@ -345,12 +370,6 @@
             if (routeLine) map.removeLayer(routeLine);
             routeLine = L.polyline(routePoly, { color: 'blue', weight: 4 }).addTo(map);
             
-            if (!isEgoCentricView) {
-                map.fitBounds(routeLine.getBounds());
-            } else {
-                map.setView([latestGNSS.lat, latestGNSS.lon], 17);
-            }
-
             waypointMarkers.slice(0, -1).forEach(m => map.removeLayer(m));
             const lastWaypoint = waypointMarkers[waypointMarkers.length - 1];
             waypointMarkers = [lastWaypoint];
@@ -360,7 +379,8 @@
             destinationMarker = L.marker([destLat, destLon], {
                 icon: L.icon({
                     iconUrl: 'https://cdn-icons-png.flaticon.com/512/684/684908.png',
-                    iconSize: [30, 30]
+                    iconSize: [30, 30],
+                    iconAnchor: [15, 15] // Center of the icon
                 })
             }).addTo(map).bindPopup("Destination").openPopup();
 
@@ -372,13 +392,32 @@
                     (man.modifier || "").toLowerCase().includes('right') ? '👉' :
                         (man.modifier || "").toLowerCase().includes('uturn') ? '↩️' : '👆';
                 const marker = L.marker([lat, lon], {
-                    icon: L.divIcon({ html: `<span style="font-size:20px">${arrow}</span>`, className: '', iconSize: [24, 24] })
+                    icon: L.divIcon({ 
+                        html: `<span style="font-size:20px">${arrow}</span>`, 
+                        className: '', 
+                        iconSize: [24, 24],
+                        iconAnchor: [12, 12]
+                    })
                 }).addTo(map).bindPopup(`Turn ${idx + 1}: ${man.instruction}`);
                 turnMarkers.push(marker);
             });
 
             statusEl.textContent = `Route ready (${(data.distance_m / 1000).toFixed(2)} km) with ${data.maneuvers.length} turns`;
             activeRoute = true;
+
+            if (isEgoCentricView && latestGNSS.lat) {
+                setEgoCentricView();
+            } else {
+                if (!isEgoCentricView) {
+                    map.fitBounds(routeLine.getBounds());
+                }
+                if (currentBearing !== 0) {
+                    setTimeout(() => {
+                        map.setBearing(currentBearing);
+                        map.setZoom(currentZoom);
+                    }, 100);
+                }
+            }
 
             // await fetch('/set_route_id', {
             //     method: 'POST',
@@ -404,7 +443,8 @@
             projMarker = L.marker([projected_pos[1], projected_pos[0]], {
                     icon: L.icon({
                     iconUrl: 'https://cdn-icons-png.flaticon.com/512/684/684908.png',
-                    iconSize: [12, 12]
+                    iconSize: [12, 12],
+                    iconAnchor: [6, 6]
                     })
                 }).addTo(map).bindPopup('proj');
             }
@@ -428,7 +468,12 @@
                         (man.modifier || "").toLowerCase().includes('right') ? '👉' :
                             (man.modifier || "").toLowerCase().includes('uturn') ? '↩️' : '👆';
                     const marker = L.marker([lat, lon], {
-                        icon: L.divIcon({ html: `<span style="font-size:20px">${arrow}</span>`, className: '', iconSize: [24, 24] })
+                        icon: L.divIcon({ 
+                            html: `<span style="font-size:20px">${arrow}</span>`, 
+                            className: '', 
+                            iconSize: [24, 24],
+                            iconAnchor: [12, 12]
+                        })
                     }).addTo(map).bindPopup(`Turn ${idx + 1}: ${man.instruction}`);
                     turnMarkers.push(marker);
                 });
@@ -450,6 +495,8 @@
         }
 
         document.getElementById('btnClear').onclick = async () => {
+            map.setBearing(0);
+            
             try {
                 await fetch('/clear_route', {
                     method: 'POST',
@@ -475,7 +522,27 @@
 
             statusEl.textContent = 'Cleared route.';
             turnArrowEl.innerHTML = '👆';
+
+            if (isEgoCentricView && latestGNSS.lat) {
+                setTimeout(() => {
+                    setEgoCentricView();
+                }, 100);
+            }
         };
+
+        function debugMarkerPosition(marker, name) {
+            if (!marker) return;
+            const latlng = marker.getLatLng();
+            console.log(`${name} Marker - Lat: ${latlng.lat}, Lng: ${latlng.lng}`);
+            console.log(`Map Bearing: ${map.getBearing()}°`);
+            
+            L.circle(latlng, {
+                color: 'red',
+                fillColor: '#f03',
+                fillOpacity: 0.5,
+                radius: 2
+            }).addTo(map).bindPopup(`${name} Exact Position`).openPopup();
+        }
     </script>
 </body>
 

@@ -146,7 +146,11 @@ def request_route_from_osrm_multi(waypoints):
         for step in leg.get("steps", []):
             maneuver = step.get("maneuver", {})
             man_type = maneuver.get("type")
-            if man_type in ("turn", "new name", "roundabout", "fork", "merge", "ramp"):
+            if man_type in (
+                    "turn", "new name", "roundabout", "roundabout exit",
+                    "fork", "merge", "ramp", "on ramp", "off ramp",
+                    "end of road", "continue", "exit rotary"
+                ):
                 loc = maneuver.get("location")
                 if not loc: continue
                 best_along = find_projection_on_polyline_window(loc[0], loc[1], poly, cuml, 0, len(poly))[0]
@@ -158,18 +162,39 @@ def request_route_from_osrm_multi(waypoints):
                     "location": (loc[0], loc[1]),
                     "distance_along": best_along
                 })
-    maneuvers.sort(key=lambda m: m["distance_along"])
-    return {
-        "poly": poly,
-        "cumulative": cuml,
-        "maneuvers": maneuvers,
-        "distance": route.get("distance"),
-        "duration": route.get("duration"),
-        "geometry": [[p[0], p[1]] for p in poly],
-        "waypoints": waypoints,
-        "last_proj_idx": 0,
-        "no_progress_count": 0
-    }
+        maneuvers.sort(key=lambda m: m["distance_along"])
+        if maneuvers:
+            last_along = maneuvers[-1]["distance_along"]
+        else:
+            last_along = 0.0
+
+        if cuml:
+            dest_along = cuml[-1]
+            dest_coord = poly[-1]
+            if not maneuvers or abs(dest_along - last_along) > 1.0:
+                maneuvers.append({
+                    "instruction": "Arrive at destination",
+                    "name": "Destination",
+                    "type": "arrive",
+                    "modifier": "",
+                    "location": (dest_coord[0], dest_coord[1]),
+                    "distance_along": dest_along
+                })
+
+        maneuvers.sort(key=lambda m: m["distance_along"])
+
+        return {
+            "poly": poly,
+            "cumulative": cuml,
+            "maneuvers": maneuvers,
+            "distance": route.get("distance"),
+            "duration": route.get("duration"),
+            "geometry": [[p[0], p[1]] for p in poly],
+            "waypoints": waypoints,
+            "last_proj_idx": 0,
+            "no_progress_count": 0
+        }
+
 
 @app.route("/route", methods=["POST"])
 def create_route():
@@ -430,4 +455,7 @@ def get_next_turn():
         return jsonify(NAV_CMD)
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    import logging
+    log = logging.getLogger('werkzeug')
+    log.setLevel(logging.ERROR)  # hide info-level logs
+    app.run(host="0.0.0.0", port=5000, debug=False)
